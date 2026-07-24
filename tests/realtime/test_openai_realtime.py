@@ -16,7 +16,10 @@ from agents.realtime.model import RealtimeModelConfig
 from agents.realtime.model_events import (
     RealtimeModelAudioEvent,
     RealtimeModelErrorEvent,
+    RealtimeModelExceptionEvent,
+    RealtimeModelOutputTextDeltaEvent,
     RealtimeModelToolCallEvent,
+    RealtimeModelTurnStartedEvent,
     RealtimeModelUsageEvent,
 )
 from agents.realtime.model_inputs import (
@@ -519,7 +522,13 @@ class TestEventHandlingRobustness(TestOpenAIRealtimeWebSocketModel):
                     self._string_adapter.validate_python(voice)
                 if event["type"] == "response.done":
                     return SimpleNamespace(type=event["type"], response=SimpleNamespace(usage=None))
-                return SimpleNamespace(type=event["type"])
+                return SimpleNamespace(
+                    type=event["type"],
+                    response=SimpleNamespace(
+                        id=None,
+                        metadata=event.get("response", {}).get("metadata"),
+                    ),
+                )
 
         monkeypatch.setattr(model, "_send_raw_message", fake_send_raw)
         model._server_event_type_adapter = CustomVoiceRejectingAdapter()
@@ -534,7 +543,9 @@ class TestEventHandlingRobustness(TestOpenAIRealtimeWebSocketModel):
 
         response_with_custom_voice = {
             "type": "response.created",
-            "response": {"audio": {"output": {"voice": {"id": "voice_test"}}}},
+            "response": {
+                "audio": {"output": {"voice": {"id": "voice_test"}}},
+            },
         }
         await model._handle_ws_event(response_with_custom_voice)
 
@@ -964,6 +975,9 @@ class TestSendEventAndConfig(TestOpenAIRealtimeWebSocketModel):
 
         await model.send_event(RealtimeModelSendUserInput(user_input="hi"))
         await asyncio.sleep(0)
+        pending_event_id = model._pending_response_create_event_id
+        assert pending_event_id is not None
+        await model._mark_response_created(pending_event_id)
         await model._mark_response_done()
         await model.send_event(RealtimeModelSendAudio(audio=b"a", commit=False))
         await model.send_event(RealtimeModelSendAudio(audio=b"a", commit=True))
@@ -1002,11 +1016,22 @@ class TestSendEventAndConfig(TestOpenAIRealtimeWebSocketModel):
         monkeypatch.setattr(model, "_send_raw_message", send_raw)
         monkeypatch.setattr(model, "_emit_event", emit_event)
 
-        await model._send_interrupt(RealtimeModelSendInterrupt(force_response_cancel=True))
+        await model._send_interrupt(
+            RealtimeModelSendInterrupt(
+                force_response_cancel=True,
+                response_id="response_1",
+            )
+        )
 
         assert send_raw.await_count == 2
         payload_types = {call.args[0].type for call in send_raw.call_args_list}
         assert payload_types == {"conversation.item.truncate", "response.cancel"}
+        cancel_event = next(
+            call.args[0]
+            for call in send_raw.call_args_list
+            if call.args[0].type == "response.cancel"
+        )
+        assert cancel_event.response_id == "response_1"
         assert model._ongoing_response is True
         assert model._response_control == "cancel_requested"
 
@@ -1014,6 +1039,38 @@ class TestSendEventAndConfig(TestOpenAIRealtimeWebSocketModel):
         assert model._ongoing_response is False
         assert model._response_control == "free"
         assert model._audio_state_tracker.get_last_audio_item() is None
+
+    @pytest.mark.asyncio
+    async def test_cancel_response_only_does_not_truncate_stale_audio(self, model, monkeypatch):
+        model._audio_state_tracker.set_audio_format("pcm16")
+        model._audio_state_tracker.on_audio_delta("stale_audio_item", 0, b"\x00" * 4800)
+        await model._mark_response_created()
+        model._created_session = SimpleNamespace(
+            audio=SimpleNamespace(
+                input=SimpleNamespace(turn_detection=SimpleNamespace(interrupt_response=True))
+            )
+        )
+
+        send_raw = AsyncMock()
+        emit_event = AsyncMock()
+        monkeypatch.setattr(model, "_send_raw_message", send_raw)
+        monkeypatch.setattr(model, "_emit_event", emit_event)
+
+        await model._send_interrupt(
+            RealtimeModelSendInterrupt(
+                force_response_cancel=True,
+                response_id="text_response",
+                cancel_response_only=True,
+            )
+        )
+
+        assert send_raw.await_count == 1
+        assert send_raw.await_args is not None
+        cancel_event = send_raw.await_args.args[0]
+        assert cancel_event.type == "response.cancel"
+        assert cancel_event.response_id == "text_response"
+        emit_event.assert_not_awaited()
+        assert model._audio_state_tracker.get_last_audio_item() == ("stale_audio_item", 0)
 
     @pytest.mark.asyncio
     async def test_interrupt_respects_auto_cancellation_when_not_forced(self, model, monkeypatch):
@@ -1038,6 +1095,221 @@ class TestSendEventAndConfig(TestOpenAIRealtimeWebSocketModel):
         assert send_raw.call_args_list[0].args[0].type == "conversation.item.truncate"
         assert all(call.args[0].type != "response.cancel" for call in send_raw.call_args_list)
         assert model._ongoing_response is True
+
+    @pytest.mark.asyncio
+    async def test_output_text_delta_emits_provider_neutral_event(self, model):
+        listener = AsyncMock()
+        model.add_listener(listener)
+
+        await model._handle_ws_event(
+            {
+                "type": "response.output_text.delta",
+                "event_id": "event_1",
+                "item_id": "item_1",
+                "response_id": "response_1",
+                "output_index": 0,
+                "content_index": 0,
+                "delta": "hello",
+            }
+        )
+
+        emitted = [call.args[0] for call in listener.on_event.call_args_list]
+        assert [event.type for event in emitted] == ["raw_server_event", "output_text_delta"]
+        text_event = emitted[1]
+        assert isinstance(text_event, RealtimeModelOutputTextDeltaEvent)
+        assert text_event.item_id == "item_1"
+        assert text_event.response_id == "response_1"
+        assert text_event.delta == "hello"
+
+    @pytest.mark.asyncio
+    async def test_response_create_correlation_skips_an_already_requested_user_turn(
+        self, model, monkeypatch
+    ):
+        payload_types: list[str] = []
+        response_create_events: list[Any] = []
+
+        async def fake_send_raw(event):
+            payload_types.append(event.type)
+            if event.type == "response.create":
+                response_create_events.append(event)
+
+        class ResponseLifecycleAdapter:
+            def validate_python(self, event):
+                return SimpleNamespace(
+                    type=event["type"],
+                    response=SimpleNamespace(
+                        id=event["response"]["id"],
+                        metadata=event["response"].get("metadata"),
+                        usage=None,
+                    ),
+                )
+
+        monkeypatch.setattr(model, "_send_raw_message", fake_send_raw)
+        model._server_event_type_adapter = ResponseLifecycleAdapter()
+        listener = AsyncMock()
+        model.add_listener(listener)
+
+        await model._send_user_input(RealtimeModelSendUserInput(user_input="user input"))
+        await asyncio.sleep(0)
+        await model._send_user_input(
+            RealtimeModelSendUserInput(
+                user_input="guardrail recovery",
+                response_create_id="recovery_1",
+            )
+        )
+        await asyncio.sleep(0)
+
+        assert payload_types == [
+            "conversation.item.create",
+            "response.create",
+            "conversation.item.create",
+        ]
+        assert len(response_create_events) == 1
+
+        await model._handle_ws_event(
+            {
+                "type": "response.created",
+                "response": {"id": "response_user"},
+            }
+        )
+        await model._handle_ws_event({"type": "response.done", "response": {"id": "response_user"}})
+        await asyncio.sleep(0)
+
+        assert payload_types[-1] == "response.create"
+        assert len(response_create_events) == 2
+        assert response_create_events[1].response is not None
+        await model._handle_ws_event(
+            {
+                "type": "response.created",
+                "response": {
+                    "id": "response_recovery",
+                    "metadata": response_create_events[1].response.metadata,
+                },
+            }
+        )
+
+        turn_started_events = [
+            call.args[0]
+            for call in listener.on_event.call_args_list
+            if isinstance(call.args[0], RealtimeModelTurnStartedEvent)
+        ]
+        assert [
+            (
+                event.response_id,
+                event.response_create_id,
+                event.is_guardrail_recovery,
+            )
+            for event in turn_started_events
+        ] == [
+            ("response_user", None, False),
+            ("response_recovery", "recovery_1", True),
+        ]
+
+    @pytest.mark.asyncio
+    async def test_server_vad_turn_does_not_consume_pending_guardrail_recovery(
+        self, model, monkeypatch
+    ):
+        response_create_events: list[Any] = []
+
+        async def fake_send_raw(event):
+            if event.type == "response.create":
+                response_create_events.append(event)
+
+        class ResponseLifecycleAdapter:
+            def validate_python(self, event):
+                return SimpleNamespace(
+                    type=event["type"],
+                    response=SimpleNamespace(
+                        id=event["response"]["id"],
+                        metadata=event["response"].get("metadata"),
+                        usage=None,
+                    ),
+                )
+
+        monkeypatch.setattr(model, "_send_raw_message", fake_send_raw)
+        model._server_event_type_adapter = ResponseLifecycleAdapter()
+        listener = AsyncMock()
+        model.add_listener(listener)
+
+        await model._send_user_input(
+            RealtimeModelSendUserInput(
+                user_input="guardrail recovery",
+                response_create_id="recovery_1",
+            )
+        )
+        await asyncio.sleep(0)
+        assert len(response_create_events) == 1
+        pending_event_id = model._pending_response_create_event_id
+        assert pending_event_id is not None
+
+        await model._handle_ws_event(
+            {"type": "response.created", "response": {"id": "response_vad"}}
+        )
+        assert model._pending_response_create_event_id == pending_event_id
+        assert model._response_control == "create_requested"
+
+        await model._handle_ws_event({"type": "response.done", "response": {"id": "response_vad"}})
+        assert model._pending_response_create_event_id == pending_event_id
+        assert model._response_control == "create_requested"
+
+        await model._handle_ws_event(
+            {
+                "type": "response.created",
+                "response": {
+                    "id": "response_recovery",
+                    "metadata": response_create_events[0].response.metadata,
+                },
+            }
+        )
+
+        turn_started_events = [
+            call.args[0]
+            for call in listener.on_event.call_args_list
+            if isinstance(call.args[0], RealtimeModelTurnStartedEvent)
+        ]
+        assert [
+            (
+                event.response_id,
+                event.response_create_id,
+                event.is_guardrail_recovery,
+            )
+            for event in turn_started_events
+        ] == [
+            ("response_vad", None, False),
+            ("response_recovery", "recovery_1", True),
+        ]
+        assert model._pending_response_create_event_id is None
+        assert model._response_control == "free"
+
+    @pytest.mark.asyncio
+    async def test_correlated_response_create_send_failure_emits_correlation(
+        self, model, monkeypatch
+    ):
+        async def fake_send_raw(event):
+            if event.type == "response.create":
+                raise RuntimeError("response.create failed")
+
+        monkeypatch.setattr(model, "_send_raw_message", fake_send_raw)
+        listener = AsyncMock()
+        model.add_listener(listener)
+
+        await model._send_user_input(
+            RealtimeModelSendUserInput(
+                user_input="guardrail recovery",
+                response_create_id="recovery_1",
+            )
+        )
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+
+        exception_events = [
+            call.args[0]
+            for call in listener.on_event.call_args_list
+            if isinstance(call.args[0], RealtimeModelExceptionEvent)
+        ]
+        assert len(exception_events) == 1
+        assert exception_events[0].response_create_id == "recovery_1"
+        assert model._response_control == "free"
 
     @pytest.mark.asyncio
     async def test_send_user_input_defers_response_create_without_blocking_caller(
@@ -1141,7 +1413,9 @@ class TestSendEventAndConfig(TestOpenAIRealtimeWebSocketModel):
         await asyncio.sleep(0)
         assert payload_types == ["conversation.item.create", "response.create"]
 
-        await model._mark_response_created()
+        pending_event_id = model._pending_response_create_event_id
+        assert pending_event_id is not None
+        await model._mark_response_created(pending_event_id)
 
         second_task = asyncio.create_task(
             model._send_user_input(RealtimeModelSendUserInput(user_input="second"))
@@ -1195,7 +1469,9 @@ class TestSendEventAndConfig(TestOpenAIRealtimeWebSocketModel):
 
         assert payload_types.count("response.create") == 1
 
-        await model._mark_response_created()
+        pending_event_id = model._pending_response_create_event_id
+        assert pending_event_id is not None
+        await model._mark_response_created(pending_event_id)
         await asyncio.sleep(0)
 
         await model._mark_response_done()
@@ -1305,6 +1581,43 @@ class TestSendEventAndConfig(TestOpenAIRealtimeWebSocketModel):
             "conversation.item.create",
             "response.create",
         ]
+
+    @pytest.mark.asyncio
+    async def test_response_create_server_error_emits_correlation(self, model, monkeypatch):
+        async def fake_send_raw(_event):
+            pass
+
+        emit_event = AsyncMock()
+        monkeypatch.setattr(model, "_send_raw_message", fake_send_raw)
+        monkeypatch.setattr(model, "_emit_event", emit_event)
+
+        await model._send_user_input(
+            RealtimeModelSendUserInput(
+                user_input="guardrail recovery",
+                response_create_id="recovery_1",
+            )
+        )
+        await asyncio.sleep(0)
+
+        pending_event_id = model._pending_response_create_event_id
+        assert pending_event_id is not None
+
+        await model._handle_ws_event(
+            {
+                "type": "error",
+                "event_id": "event_err_1",
+                "error": {
+                    "type": "invalid_request_error",
+                    "code": "bad_response_create",
+                    "message": "bad response.create",
+                    "event_id": pending_event_id,
+                },
+            }
+        )
+
+        error_event = emit_event.call_args_list[-1].args[0]
+        assert isinstance(error_event, RealtimeModelErrorEvent)
+        assert error_event.response_create_id == "recovery_1"
 
     @pytest.mark.asyncio
     async def test_missing_unrelated_error_event_id_does_not_release_in_flight_response_create(
@@ -1643,7 +1956,9 @@ class TestSendEventAndConfig(TestOpenAIRealtimeWebSocketModel):
 
         assert payload_types.count("response.create") == 1
 
-        await model._mark_response_created()
+        pending_event_id = model._pending_response_create_event_id
+        assert pending_event_id is not None
+        await model._mark_response_created(pending_event_id)
         await model._mark_response_done()
         await asyncio.sleep(0)
 
@@ -1693,7 +2008,9 @@ class TestSendEventAndConfig(TestOpenAIRealtimeWebSocketModel):
 
         assert payload_types.count("response.create") == 1
 
-        await model._mark_response_created()
+        pending_event_id = model._pending_response_create_event_id
+        assert pending_event_id is not None
+        await model._mark_response_created(pending_event_id)
         await model._mark_response_done()
         await asyncio.sleep(0)
 

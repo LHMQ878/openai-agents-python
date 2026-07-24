@@ -579,6 +579,10 @@ class RunResultStreaming(RunResultBase):
     interruptions: list[ToolApprovalItem] = field(default_factory=list)
     """Pending tool approval requests (interruptions) for this run."""
     _waiting_on_event_queue: bool = field(default=False, repr=False)
+    _active_stream_consumers: int = field(default=0, init=False, repr=False)
+    _stream_consumers_stopped: asyncio.Event = field(
+        default_factory=asyncio.Event, init=False, repr=False
+    )
 
     _current_turn_persisted_item_count: int = 0
     """Number of items from new_items already persisted to session for the
@@ -775,6 +779,22 @@ class RunResultStreaming(RunResultBase):
             # Don't call _cleanup_tasks() or clear queues yet
             pass
 
+    async def _wait_for_turn_event_consumption(self) -> None:
+        """Wait for active consumers to finish processing the current turn's events."""
+        if self._active_stream_consumers == 0:
+            return
+
+        queue_drained = asyncio.create_task(self._event_queue.join())
+        consumers_stopped = asyncio.create_task(self._stream_consumers_stopped.wait())
+        tasks = {queue_drained, consumers_stopped}
+        try:
+            await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+        finally:
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+
     async def stream_events(self) -> AsyncIterator[StreamEvent]:
         """Stream deltas for new items as they are generated. We're using the types from the
         OpenAI Responses API, so these are semantic events: each event has a `type` field that
@@ -784,9 +804,45 @@ class RunResultStreaming(RunResultBase):
         - A MaxTurnsExceeded exception if the agent exceeds the max_turns limit.
         - A GuardrailTripwireTriggered exception if a guardrail is tripped.
         """
+        registered_consumer_task: asyncio.Task[Any] | None = None
+        item_acknowledgement_pending = False
+
+        def acknowledge_item() -> None:
+            nonlocal item_acknowledgement_pending
+            if not item_acknowledgement_pending:
+                return
+            item_acknowledgement_pending = False
+            self._event_queue.task_done()
+
+        def unregister_consumer(task: asyncio.Task[Any]) -> None:
+            nonlocal registered_consumer_task
+            if registered_consumer_task is not task:
+                return
+            acknowledge_item()
+            registered_consumer_task = None
+            self._active_stream_consumers -= 1
+            if self._active_stream_consumers == 0:
+                self._stream_consumers_stopped.set()
+
+        def register_current_consumer() -> None:
+            nonlocal registered_consumer_task
+            current_task = asyncio.current_task()
+            if current_task is None or registered_consumer_task is current_task:
+                return
+            if registered_consumer_task is not None:
+                previous_task = registered_consumer_task
+                previous_task.remove_done_callback(unregister_consumer)
+                unregister_consumer(previous_task)
+            registered_consumer_task = current_task
+            self._active_stream_consumers += 1
+            self._stream_consumers_stopped.clear()
+            current_task.add_done_callback(unregister_consumer)
+
+        register_current_consumer()
         cancelled = False
         try:
             while True:
+                register_current_consumer()
                 self._check_errors()
                 should_drain_queued_events = isinstance(
                     self._stored_exception, MaxTurnsExceeded
@@ -826,9 +882,16 @@ class RunResultStreaming(RunResultBase):
                     self._check_errors()
                     break
 
-                yield item
-                self._event_queue.task_done()
+                item_acknowledgement_pending = True
+                try:
+                    yield item
+                finally:
+                    acknowledge_item()
         finally:
+            if registered_consumer_task is not None:
+                consumer_task = registered_consumer_task
+                consumer_task.remove_done_callback(unregister_consumer)
+                unregister_consumer(consumer_task)
             try:
                 if cancelled:
                     # Cancellation should return promptly, so avoid waiting on long-running tasks.
